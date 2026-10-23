@@ -771,6 +771,11 @@ pub struct Core<M: TextEngine> {
     /// headers under the status bar).
     safe_area: EdgeInsets,
     list_binds: Vec<ListBind>,
+    /// The runtime's lists with overscan cells waiting to bind
+    /// ([`Core::take_paced_list_binds`]), in the order they asked.
+    paced_lists: Vec<NodeId>,
+    /// [`Core::take_paced_list_binds`]'s buffer, reused.
+    paced_scratch: Vec<(u32, u32)>,
     /// The events for JS, in order (the platform's and the core's events,
     /// Rust components' events, calls' results).
     events: Vec<crate::ui::JsEvent>,
@@ -836,6 +841,9 @@ pub struct Core<M: TextEngine> {
     /// Serves the app's clipboard calls in place of the platform
     /// ([`Core::set_clipboard`]).
     clipboard: Option<Arc<dyn crate::clipboard::ClipboardBackend>>,
+    /// Answers the app's picks in place of the platform's picker
+    /// ([`Core::set_picker`]).
+    picker: Option<Arc<dyn crate::picker::PickerBackend>>,
     /// Rust components and what they rendered.
     components: components::Components,
     /// Overlay nodes, those shown in the order they were shown (the last
@@ -885,6 +893,7 @@ impl<M: TextEngine> Core<M> {
             access: Arc::default(),
             denied: Default::default(),
             clipboard: None,
+            picker: None,
             components: components::Components::for_viewport(viewport),
             lists: Vec::new(),
             parent_lists: Vec::new(),
@@ -901,6 +910,8 @@ impl<M: TextEngine> Core<M> {
             header_heights: (Points(44.0), Points(96.0)),
             safe_area: EdgeInsets::default(),
             list_binds: Vec::new(),
+            paced_lists: Vec::new(),
+            paced_scratch: Vec::new(),
             events: Vec::new(),
             cells_scratch: Vec::new(),
             root,
@@ -1059,6 +1070,13 @@ impl<M: TextEngine> Core<M> {
         self.clipboard = backend;
     }
 
+    /// Answers the app's picks (`Picker.pickImages`) with `backend`, an
+    /// embedding app's own picker or a test's files, instead of showing the
+    /// platform's picker (`None`: the platform's, the default).
+    pub fn set_picker(&mut self, backend: Option<Arc<dyn crate::picker::PickerBackend>>) {
+        self.picker = backend;
+    }
+
     /// Keeps the app's storage (`nsh/storage`) in `backend`; `None`: in
     /// memory, for the core's life.
     pub fn set_storage(&mut self, backend: Option<Arc<dyn crate::storage::StorageBackend>>) {
@@ -1155,9 +1173,56 @@ impl<M: TextEngine> Core<M> {
         Some((scroll.event_throttle_ms, content * z, frame, z))
     }
 
-    /// Moves list render requests produced by the last commit into `out`.
+    /// Moves list render requests produced by the last commit into `out`:
+    /// what must bind before the frame shows (cells whose item moved, cells
+    /// in the viewport and just ahead of it). The rest of the overscan
+    /// waits ([`Core::take_paced_list_binds`]).
     pub fn take_list_binds(&mut self, out: &mut Vec<ListBind>) {
         out.append(&mut self.list_binds);
+    }
+
+    /// Whether lists have overscan cells waiting to bind.
+    pub fn has_paced_list_binds(&self) -> bool {
+        !self.paced_lists.is_empty()
+    }
+
+    /// Hands out up to `cells` of the overscan cells waiting to bind, one
+    /// per list in turn (a nested list is not starved by its parent), each
+    /// list's nearest its leading edge first. What a list assigns now is
+    /// what waits: cells it left or whose items went are never handed out.
+    pub fn take_paced_list_binds(&mut self, cells: usize, out: &mut Vec<ListBind>) {
+        let mut left = cells;
+        let mut lists = std::mem::take(&mut self.paced_lists);
+        let mut one = std::mem::take(&mut self.paced_scratch);
+        let start = out.len();
+        while left > 0 && !lists.is_empty() {
+            lists.retain(|&id| {
+                if left == 0 {
+                    return true;
+                }
+                let Some(list) = self
+                    .key(id)
+                    .ok()
+                    .and_then(|key| self.nodes[key as usize].list.as_mut())
+                else {
+                    return false;
+                };
+                one.clear();
+                left -= list.take_paced(1, &mut one);
+                if let Some((slot, index)) = one.pop() {
+                    match out[start..].iter_mut().find(|b| b.list == id) {
+                        Some(bind) => bind.binds.push((slot, index)),
+                        None => out.push(ListBind {
+                            list: id,
+                            binds: vec![(slot, index)],
+                        }),
+                    }
+                }
+                list.has_paced()
+            });
+        }
+        self.paced_lists = lists;
+        self.paced_scratch = one;
     }
 
     /// Moves what the core hands JS (events it raised, such as
@@ -1594,6 +1659,27 @@ impl<M: TextEngine> Core<M> {
                         }
                         _ => {}
                     }
+                    continue;
+                }
+                // Checked before the grants: a host may put the name in a
+                // path or a URL, where `user.x/../admin` leaves `user.*`.
+                Command::HostCall { id: call, name, .. }
+                    if !crate::access::valid_host_name(name) =>
+                {
+                    let message = format!(
+                        "nsh/host: invalid function name {name:?} ({})",
+                        crate::access::HOST_NAME_CHARS
+                    );
+                    self.answer_host(*call, Err(message.clone()));
+                    self.deny(message);
+                    continue;
+                }
+                Command::HostCall { id: call, name, .. } if !self.access.allows_host(name) => {
+                    let message = format!(
+                        "nsh/host: `{name}` is not granted: add it to capabilities.host in nsh.json"
+                    );
+                    self.answer_host(*call, Err(message.clone()));
+                    self.deny(message);
                     continue;
                 }
                 Command::StatusBar(_) if !self.access.allows_status_bar() => {
@@ -2523,7 +2609,9 @@ impl<M: TextEngine> Core<M> {
                 }
             }
             Prop::Splice(at, removed, inserted) => {
+                let loads_at_start = node.events.contains(EventKind::LoadMoreAtStart);
                 if let Some(list) = node.list.as_mut() {
+                    list.loads_at_start = loads_at_start;
                     list.splice(at, removed, inserted);
                 }
             }
@@ -2580,6 +2668,11 @@ impl<M: TextEngine> Core<M> {
             Prop::LoadMoreThreshold(threshold) => {
                 if let Some(list) = node.list.as_mut() {
                     list.end_threshold = threshold.max(0.0);
+                }
+            }
+            Prop::LoadMoreAtStartThreshold(threshold) => {
+                if let Some(list) = node.list.as_mut() {
+                    list.start_threshold = threshold.max(0.0);
                 }
             }
             Prop::CellIndex(index) => {
@@ -4213,8 +4306,23 @@ impl<M: TextEngine> Core<M> {
         if !same_layout {
             cx.layout_hash = cx.alignments.layout_hash(&cx.text);
             cx.cache = None;
-            self.layout.mark_dirty(layout);
-            self.needs_layout = true;
+            // A text that measures as before leaves every layout standing:
+            // only the text is mounted again. Attachments are placed by its
+            // final layout, laid out again with the rest.
+            let attachments =
+                !cx.alignments.is_empty() || !self.nodes[key as usize].attached.is_empty();
+            let engine = &self.text_engine;
+            let cache = &mut self.measure_cache;
+            if attachments
+                || !self
+                    .layout
+                    .measures_as_before(layout, |input, _, cx, style| {
+                        measure_leaf(engine, cache, input, cx, style)
+                    })
+            {
+                self.layout.mark_dirty(layout);
+                self.needs_layout = true;
+            }
         }
         true
     }
@@ -5334,6 +5442,13 @@ impl<M: TextEngine> Core<M> {
                 .filter_map(|s| s.ready().map(|i| (i, s.cell))),
         );
         let extras = list.extras;
+        // An inverted list that loads at its start keeps its rows in
+        // place when scrolled away from it (`keeps_visible_rows`).
+        self.nodes[key as usize]
+            .list
+            .as_mut()
+            .expect("list")
+            .loads_at_start = events.contains(EventKind::LoadMoreAtStart);
         let mut anchor = 0.0;
         for &(index, cell) in &ready {
             if let Some(cell_layout) = self.nodes.get(cell as usize).and_then(|c| c.layout) {
@@ -5463,17 +5578,32 @@ impl<M: TextEngine> Core<M> {
             self.commands.push((id, command));
         }
 
+        // The components' own lists bind in the core, at once; the
+        // runtime's pace their overscan.
+        let paced = !self.components.is_virtual_list(id);
         let list = self.nodes[key as usize].list.as_mut().expect("list");
+        list.paced = paced;
         let mut binds = Vec::new();
-        if list.update_window(&mut binds) {
+        let edges = list.update_window(&mut binds);
+        if edges.end {
             self.events.push(crate::ui::JsEvent::Event(
                 id,
                 EventKind::LoadMore,
                 EventPayload::None,
             ));
         }
+        if edges.start && events.contains(EventKind::LoadMoreAtStart) {
+            self.events.push(crate::ui::JsEvent::Event(
+                id,
+                EventKind::LoadMoreAtStart,
+                EventPayload::None,
+            ));
+        }
         if !binds.is_empty() {
             self.list_binds.push(ListBind { list: id, binds });
+        }
+        if list.paced && list.has_paced() && !self.paced_lists.contains(&id) {
+            self.paced_lists.push(id);
         }
         if events.contains(EventKind::ViewableItemsChange) {
             let viewable = list.viewable_items();
@@ -5504,10 +5634,11 @@ impl<M: TextEngine> Core<M> {
                 .iter()
                 .filter_map(|s| s.ready().map(|i| (i, s.cell))),
         );
-        // Cells left without an item still show their last one. Those
-        // in the render window (the data shrank, the list jumped) would
-        // show through: move them out of sight. Cells the window left
-        // behind while scrolling are out of sight already.
+        // Cells left without an item, or not showing theirs yet (a paced
+        // bind, or one the frame's rounds did not reach), still show their
+        // last one. Those in the render window (the data changed, the list
+        // jumped) would show through: move them out of sight. Cells the
+        // window left behind while scrolling are out of sight already.
         let (window_start, window_end) = list.render_window();
         // In its parent's viewport, the cells start inside the list's
         // border and padding.
@@ -5515,7 +5646,7 @@ impl<M: TextEngine> Core<M> {
         let hidden: Vec<Key> = list
             .slots
             .iter()
-            .filter(|s| s.index.is_none() && s.cell != u32::MAX)
+            .filter(|s| s.ready().is_none() && s.cell != u32::MAX)
             .map(|s| s.cell)
             .collect();
         for cell in hidden {
@@ -6056,6 +6187,7 @@ fn apply_native(control: &mut NativeProps, prop: NativeProp) {
         (NativeProps::Video(p), P::VideoResizeMode(v)) => p.resize_mode = v,
         (NativeProps::Video(p), P::Controls(v)) => p.controls = v,
         (NativeProps::Video(p), P::ProgressInterval(v)) => p.progress_interval_ms = v.max(16.0),
+        (NativeProps::Video(p), P::AudioSession(v)) => p.audio_session = v,
         _ => {}
     }
 }

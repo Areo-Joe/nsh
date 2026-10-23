@@ -1516,7 +1516,8 @@ fn scroll_content_is_sent_once_per_batch() {
 }
 
 /// Plays JS: creates a cell per new slot, renders a fixed-height
-/// row for each bind and confirms the index.
+/// row for each bind and confirms the index; the overscan too, as an
+/// engine with time to spare does.
 fn render_binds(
     c: &mut Core<FakeEngine>,
     next_id: &mut u32,
@@ -1525,6 +1526,7 @@ fn render_binds(
 ) -> usize {
     let mut binds = Vec::new();
     c.take_list_binds(&mut binds);
+    c.take_paced_list_binds(usize::MAX, &mut binds);
     let mut count = 0;
     for bind in binds {
         for (slot, index) in bind.binds {
@@ -6451,6 +6453,36 @@ mod components {
         assert_eq!(frame_of(&batch, w4).map(|f| f.origin.y.0), Some(26.0));
         assert!(wrapper_of(&batch, 4).is_none() && wrapper_of(&batch, 6).is_none());
 
+        // A child moved (inserted again, as a keyed `<Each>` moves its row)
+        // keeps its wrapper and stays in it; the wrapper moves.
+        apply(
+            &mut c,
+            vec![Op::Insert {
+                parent: 2,
+                child: 8,
+                before: None,
+            }],
+        );
+        let batch = c.commit().unwrap();
+        assert!(
+            !batch
+                .items
+                .iter()
+                .any(|i| matches!(i, MountItem::Remove { id } if *id == 8)),
+            "the moved child stays in its wrapper"
+        );
+        assert_eq!(frame_of(&batch, w8).map(|f| f.origin.y.0), Some(52.0));
+        assert_eq!(frame_of(&batch, w4).map(|f| f.origin.y.0), Some(0.0));
+        apply(
+            &mut c,
+            vec![Op::Insert {
+                parent: 2,
+                child: 8,
+                before: Some(4),
+            }],
+        );
+        c.commit().unwrap();
+
         // A child removed takes its wrapper away; the child itself stays JS's.
         apply(
             &mut c,
@@ -7930,6 +7962,138 @@ mod components {
         );
         let shown = run_until(&mut c, |s| s.iter().any(|t| t.starts_with("pasted f")));
         assert_eq!(shown.last().unwrap(), "pasted false None ");
+    }
+
+    /// Picks up to two photos when pressed and shows what came.
+    #[component]
+    fn PhotoPicker() -> impl IntoElement {
+        let picked = signal(String::new());
+        view()
+            .child(text(move || format!("picked {}", picked.get())))
+            .child(view().h(px(10.0)).on_press(move |_: &()| {
+                let files = pick_images(crate::picker::PickRequest::new(true, 2));
+                spawn(async move {
+                    let files = files.await;
+                    let shown: Vec<String> = files
+                        .iter()
+                        .map(|f| {
+                            format!(
+                                "{} {} {}x{} {}",
+                                f.name,
+                                f.mime,
+                                f.size.width.0,
+                                f.size.height.0,
+                                f.data.len()
+                            )
+                        })
+                        .collect();
+                    picked.set(format!("{} [{}]", files.len(), shown.join(", ")));
+                });
+            }))
+    }
+
+    /// A 3×2 PNG's header.
+    fn png_header() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
+            0, 0, 3, 0, 0, 0, 2, 8, 6, 0, 0, 0,
+        ]
+    }
+
+    fn press_picker(c: &mut Core<FakeEngine>) -> Vec<MountItem> {
+        c.mount_root(&crate::ui::Root::new::<PhotoPicker>(|| ()));
+        let batch = c.commit().unwrap();
+        let button = batch
+            .items
+            .iter()
+            .find_map(|i| match i {
+                MountItem::Events { id, events } if events.contains(EventKind::Press) => Some(*id),
+                _ => None,
+            })
+            .expect("the button");
+        assert!(c.component_event(button, EventKind::Press, &EventPayload::None));
+        c.commit().map(|b| b.items).unwrap_or_default()
+    }
+
+    #[test]
+    fn picked_files_answer_the_pick() {
+        let mut c = core();
+        let items = press_picker(&mut c);
+        let picks: Vec<_> = items
+            .into_iter()
+            .filter_map(|i| match i {
+                MountItem::Command {
+                    id: ROOT_ID,
+                    command: Command::PickImages { id, request },
+                } => Some((id, request)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(picks.len(), 1);
+        let (id, request) = picks[0];
+        assert_eq!(request.limit, 2);
+        let file = |name: &str| crate::picker::PickedFile {
+            name: name.into(),
+            data: crate::ImageData::new(png_header()),
+            ..Default::default()
+        };
+        // The platform's answer is completed (type, size, extension) and
+        // cut to the request's limit.
+        let files = vec![file("IMG_1"), file("b.png"), file("c.png")];
+        assert!(c.component_event(
+            ROOT_ID,
+            EventKind::Pick,
+            &EventPayload::Picked { id, files }
+        ));
+        let shown = run_until(&mut c, |s| s.iter().any(|t| t.starts_with("picked 2")));
+        assert_eq!(
+            shown.last().unwrap(),
+            "picked 2 [IMG_1.png image/png 3x2 29, b.png image/png 3x2 29]"
+        );
+    }
+
+    struct TestPicker;
+
+    impl crate::picker::PickerBackend for TestPicker {
+        fn pick_images(&self, request: crate::picker::PickRequest) -> crate::picker::PickFuture {
+            assert_eq!(request.limit, 2);
+            Box::pin(async {
+                vec![crate::picker::PickedFile::new(
+                    "x.png",
+                    "",
+                    crate::ImageData::new(png_header()),
+                )]
+            })
+        }
+    }
+
+    #[test]
+    fn a_picker_of_the_embedder_answers_in_place_of_the_platform() {
+        let mut c = core();
+        c.set_picker(Some(std::sync::Arc::new(TestPicker)));
+        let items = press_picker(&mut c);
+        assert!(
+            !items.iter().any(|i| matches!(i, MountItem::Command { .. })),
+            "nothing reaches the platform"
+        );
+        let shown = run_until(&mut c, |s| s.iter().any(|t| t.starts_with("picked 1")));
+        assert_eq!(shown.last().unwrap(), "picked 1 [x.png image/png 3x2 29]");
+    }
+
+    #[test]
+    fn picks_need_the_capability() {
+        let mut c = core();
+        c.set_access(std::sync::Arc::new(crate::access::Access {
+            declared: crate::access::Capabilities::from_json(&serde_json::json!({})).unwrap(),
+            granted: None,
+        }));
+        let items = press_picker(&mut c);
+        assert!(
+            !items.iter().any(|i| matches!(i, MountItem::Command { .. })),
+            "nothing reaches the platform"
+        );
+        let shown = run_until(&mut c, |s| s.iter().any(|t| t.starts_with("picked 0")));
+        assert_eq!(shown.last().unwrap(), "picked 0 []");
     }
 
     /// Shows a fallback while a component below it failed; a press tries
@@ -11547,14 +11711,19 @@ mod views {
         /// Its cells have a size of their own: what their text says moves
         /// nothing around them.
         fixed: bool,
+        /// Each tick changes how wide the changing values are (a sign comes
+        /// and goes); otherwise they keep their width, but for the rare
+        /// digit a price gains (the tests' text engine gives every
+        /// character one width, as tabular figures have).
+        widening: bool,
     }
 
     /// A page of high-frequency updates, a quote board: 80 rows of a
     /// mark and five cells (about a thousand nodes), the first cells of 40
-    /// rows changing together on each press, their texts' lengths too.
+    /// rows changing together on each press.
     #[component]
     fn Board(props: BoardProps) -> impl IntoElement {
-        let fixed = props.fixed;
+        let (fixed, widening) = (props.fixed, props.widening);
         let ticks: Vec<Signal<u32>> = (0..BOARD_TICKING).map(|_| signal(0)).collect();
         let pressed = ticks.clone();
         let cell = move |content: Text| {
@@ -11575,10 +11744,11 @@ mod views {
             })
             .children((0..BOARD_ROWS).map(|row| {
                 let first = match ticks.get(row) {
-                    // A price: its length changes as it grows.
-                    Some(&tick) => {
-                        text(move || format!("{}.{:02}", 9 + tick.get() / 3, tick.get() % 100))
-                    }
+                    Some(&tick) => text(move || {
+                        let t = tick.get();
+                        let sign = if widening && t % 2 == 1 { "+" } else { "" };
+                        format!("{sign}{}.{:02}", 9 + t / 3, t % 100)
+                    }),
                     None => text(format!("{row}.00")),
                 };
                 view()
@@ -11595,14 +11765,18 @@ mod views {
     /// `cargo test --release -p nsh-core bench_high_frequency -- --ignored --nocapture`
     ///
     /// The cost of a commit when many values of a large page change at
-    /// once and often: [`Board`] with fixed cells and with cells that
-    /// take their text's size.
+    /// once and often: [`Board`] with fixed cells, and with cells that
+    /// take their text's size, the values keeping their widths or not.
     #[test]
     #[ignore]
     fn bench_high_frequency() {
-        for fixed in [true, false] {
+        for (fixed, widening, label) in [
+            (true, false, "fixed cells"),
+            (false, false, "content-sized cells, same widths"),
+            (false, true, "content-sized cells, new widths"),
+        ] {
             let mut c = core();
-            c.mount_root(&Root::new::<Board>(move || BoardProps { fixed }));
+            c.mount_root(&Root::new::<Board>(move || BoardProps { fixed, widening }));
             let first = c.commit().unwrap();
             let nodes = first
                 .items
@@ -11622,9 +11796,8 @@ mod views {
                 commit += mid.elapsed();
             }
             eprintln!(
-                "high frequency ({} cells, {nodes} views, {BOARD_TICKING} values a tick): \
+                "high frequency ({label}, {nodes} views, {BOARD_TICKING} values a tick): \
                  {:?} per event, {:?} per commit, {} mount items",
-                if fixed { "fixed" } else { "content-sized" },
                 event / n,
                 commit / n,
                 items / n as usize
@@ -15138,6 +15311,8 @@ fn render_lists_binds(
 ) {
     let mut binds = Vec::new();
     c.take_list_binds(&mut binds);
+    // The overscan too, as an engine with time to spare binds it.
+    c.take_paced_list_binds(usize::MAX, &mut binds);
     for bind in binds {
         let list_cells = cells.entry(bind.list).or_default();
         for (slot, index) in bind.binds {
@@ -16382,4 +16557,125 @@ fn a_relayout_boundary_that_overflows_more_lays_its_parent_out_again() {
         _ => None,
     });
     assert_eq!(content, Some(500.0));
+}
+
+#[test]
+fn a_text_that_measures_as_before_lays_nothing_out_again() {
+    let mut c = core();
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::View,
+            },
+            style_op(2, &[("flexDirection", StyleValue::Str("row"))]),
+            Op::Create {
+                id: 4,
+                tag: Tag::Text,
+            },
+            Op::CreateText {
+                id: 5,
+                text: "9.07".into(),
+            },
+            Op::Insert {
+                parent: 4,
+                child: 5,
+                before: None,
+            },
+            Op::Create {
+                id: 6,
+                tag: Tag::View,
+            },
+            style_op(
+                6,
+                &[
+                    ("width", StyleValue::Number(10.0)),
+                    ("height", StyleValue::Number(10.0)),
+                ],
+            ),
+            Op::Insert {
+                parent: 2,
+                child: 4,
+                before: None,
+            },
+            Op::Insert {
+                parent: 2,
+                child: 6,
+                before: None,
+            },
+            Op::Insert {
+                parent: ROOT_ID,
+                child: 2,
+                before: None,
+            },
+        ],
+    );
+    let first = c.commit().unwrap();
+    let after = frame_of(&first, 6).unwrap().origin.x;
+    let root = c.nodes[c.root as usize].layout.unwrap();
+    // As wide as before (the tests' engine gives each character one width):
+    // nothing to lay out again, the text mounted again.
+    c.apply(Op::SetText {
+        id: 5,
+        text: "9.14".into(),
+    })
+    .unwrap();
+    c.flush_dirty();
+    assert!(!c.needs_layout && !c.layout.dirty(root));
+    let batch = c.commit().unwrap();
+    assert!(
+        matches!(&batch.items[..], [MountItem::Text { id: 4, text, .. }] if text.text == "9.14")
+    );
+    // Wider: laid out again, and its sibling moves.
+    c.apply(Op::SetText {
+        id: 5,
+        text: "+9.21".into(),
+    })
+    .unwrap();
+    c.flush_dirty();
+    assert!(c.needs_layout && c.layout.dirty(root));
+    let batch = c.commit().unwrap();
+    assert!(frame_of(&batch, 4).is_some());
+    assert!(frame_of(&batch, 6).unwrap().origin.x > after);
+}
+
+#[test]
+fn audio_session_reaches_the_video() {
+    // A lesson's speech plays in silent mode: the prop reaches the
+    // platform's player.
+    let mut c = core();
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::Video,
+            },
+            Op::SetProp {
+                id: 2,
+                prop: Prop::Native(crate::NativeProp::AudioSession(
+                    crate::AudioSession::Playback,
+                )),
+            },
+            Op::Insert {
+                parent: ROOT_ID,
+                child: 2,
+                before: None,
+            },
+        ],
+    );
+    let items = c.commit().unwrap();
+    let props = items
+        .items
+        .iter()
+        .find_map(|item| match item {
+            MountItem::NativeProps {
+                id: 2,
+                props: crate::NativeProps::Video(v),
+            } => Some(v),
+            _ => None,
+        })
+        .expect("the video's props");
+    assert_eq!(props.audio_session, crate::AudioSession::Playback);
 }
