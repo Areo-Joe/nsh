@@ -18,6 +18,7 @@ the other platform crates off their targets). They are built for the machine its
 cargo clippy -p nsh-platform-macos -p nsh-macos-host -p nsh-macos-app --all-targets --features nsh-platform-macos/dev
 cargo test -p nsh-platform-macos --features dev   # needs no window server: tests do not start AppKit
 cargo build -p nsh-macos-host                     # ./target/debug/nsh-macos-host
+./target/debug/nsh test crates/nsh-platform-macos/tests/line-height --target macos
 ```
 
 Features: `js` (default; JS apps; without it the crate only runs Rust apps and links no QuickJS) and `dev` (the dev
@@ -160,9 +161,27 @@ server client, log forwarding, the error overlay: `dev.rs`). The runtime needs m
 
 ## Keyboard
 
-Single-line fields center the native font's line in the input's content box. Their attributed placeholders use
-the same natural line height as the field editor, including when `text-base` supplies a larger `lineHeight` for
-layout. Multiline text views use the configured paragraph line height.
+Single-line fields center the configured line box in the input's content box. Values, placeholders and field
+editors share the paragraph line height and a baseline offset that splits extra leading around the font's line.
+An unset line height uses native font metrics. The field's intrinsic size only reflects its font, so explicit line
+heights also set its frame height to keep the field editor's clipping view in sync. The field's stored attributed
+value is restored after editing ends, without replacing the text of an active field editor.
+
+Multiline editors and their noninteractive placeholder views both explicitly use TextKit 2, with the same
+paragraph style, container padding and content box. They use native paragraph metrics without the single-line
+baseline offset: combining positive baseline offsets with fixed paragraph heights can shorten multiline line
+fragments on macOS 15. Text-storage attribute updates notify the content manager through editing transactions.
+The decorative placeholder is excluded from accessibility; the real editor exposes its text as the accessibility
+placeholder value, updated or cleared with the input configuration.
+
+Shared field-editor defaults are captured before AppKit configures the cell and restored when focus ends or the
+input is removed. A delegate ownership check keeps late cleanup from changing another native control's editor.
+Animated text colors also update an unfocused field's attributed foreground color, preserving its font,
+paragraph and baseline attributes; an active field editor receives the color directly.
+
+The native line-height tests above inspect caret geometry while typing, switching focus, changing line height,
+replacing values, pasting and toggling password fields. They require the AppKit host; headless tests cannot
+measure the native field editor.
 
 A key goes to the window's first responder: a field's editor (the window's shared field editor, an `NSTextView`), a
 multiline input's `NshTextView`, a hosted view, or the surface's root. Menus' key equivalents (`app.rs`: Cmd+Q / H /

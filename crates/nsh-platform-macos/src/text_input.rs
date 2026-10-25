@@ -8,10 +8,11 @@
 //! core's style like any other view, so the editors draw only text: they
 //! are borderless, without a background or focus ring, with the config's
 //! font, colors and alignment. A single-line field shows its own
-//! placeholder (an attributed one); a text view has none, so a label under
-//! it shows the placeholder while the text is empty. Single-line text
-//! and placeholders share the field editor's natural font metrics;
-//! multiline paragraphs use the configured line height.
+//! placeholder (an attributed one); a text view has none, so a noninteractive
+//! TextKit 2 view under it shows the placeholder while the text is empty.
+//! Multiline values and placeholders use native paragraph metrics. Single-line values,
+//! placeholders and field editors share the configured paragraph line
+//! height and split extra leading above and below the font's line.
 //!
 //! The fields are subclasses ([`define_field!`]) only to hear what AppKit
 //! tells a field's delegate's delegate: AppKit edits a field with the
@@ -61,17 +62,18 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSBorderType, NSColor, NSControl, NSControlTextEditingDelegate, NSEvent,
-    NSEventModifierFlags, NSEventType, NSFocusRingType, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSLineBreakMode, NSMutableParagraphStyle,
-    NSParagraphStyleAttributeName, NSPasteboard, NSResponder, NSScrollView, NSSecureTextField,
-    NSText, NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextInputClient,
-    NSTextView, NSTextViewDelegate, NSValidatedUserInterfaceItem, NSView, NSWritingDirection,
+    NSAccessibility, NSApplication, NSBaselineOffsetAttributeName, NSBorderType, NSColor,
+    NSControl, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSEventType,
+    NSFocusRingType, NSFontAttributeName, NSForegroundColorAttributeName, NSLineBreakMode,
+    NSMutableParagraphStyle, NSParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
+    NSResponder, NSScrollView, NSSecureTextField, NSText, NSTextAlignment, NSTextDelegate,
+    NSTextField, NSTextFieldDelegate, NSTextInputClient, NSTextStorage, NSTextView,
+    NSTextViewDelegate, NSValidatedUserInterfaceItem, NSView, NSWritingDirection,
 };
 use objc2_core_foundation::{CGFloat, CGSize};
 use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange,
-    NSString,
+    NSAttributedString, NSDictionary, NSMutableAttributedString, NSMutableCopying, NSNotification,
+    NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRange, NSString,
 };
 
 use crate::{
@@ -91,6 +93,8 @@ enum Editor {
     Area {
         scroller: Retained<NSScrollView>,
         view: Retained<NSTextView>,
+        /// Uses the same text system and container geometry as the value.
+        placeholder: Retained<NSTextView>,
     },
 }
 
@@ -258,8 +262,6 @@ pub(crate) struct InputState {
     delegate: Retained<InputDelegate>,
     /// Fills the view and holds the editor ([`InputPad`]).
     pad: Retained<NSView>,
-    /// A text view's placeholder, under it while its text is empty.
-    placeholder: Retained<NSTextField>,
     config: RefCell<InputConfig>,
     /// A configuration was applied (auto focus happens on the first).
     configured: Cell<bool>,
@@ -298,7 +300,38 @@ pub(crate) struct InputState {
     key_mods: Cell<NSEventModifierFlags>,
     /// The animated text color applied.
     anim_color: Cell<Option<Color>>,
+    /// Attributes borrowed from a shared AppKit field editor while focused.
+    field_style: RefCell<Option<FieldEditorStyle>>,
     cx: Ctx,
+}
+
+/// Restores a shared editor before AppKit gives it to another native control.
+struct FieldEditorStyle {
+    editor: objc2::rc::Weak<NSTextView>,
+    owner: objc2::rc::Weak<NSTextField>,
+    paragraph: Option<Retained<NSParagraphStyle>>,
+    typing: Retained<NSDictionary<NSString, AnyObject>>,
+}
+
+impl Drop for FieldEditorStyle {
+    fn drop(&mut self) {
+        let Some(editor) = self.editor.load() else {
+            return;
+        };
+        // Removal can outlive focus callbacks. Leave a new owner's editor alone.
+        if let Some(delegate) = editor.delegate() {
+            let current: &AnyObject = ProtocolObject::as_ref(&*delegate);
+            if self.owner.load().is_none_or(|owner| {
+                let owner: &AnyObject = owner.as_ref();
+                !std::ptr::eq(current, owner)
+            }) {
+                return;
+            }
+        }
+        editor.setDefaultParagraphStyle(self.paragraph.as_deref());
+        // SAFETY: these are the editor's own previously saved typing attributes.
+        unsafe { editor.setTypingAttributes(&self.typing) };
+    }
 }
 
 /// What the editors' callbacks need, without keeping anything alive.
@@ -518,6 +551,9 @@ impl Ctx {
             // Leaving the input ends its composition.
             input.editing.set(false);
             self.compose(&input, None);
+            input.restore_field_editor();
+            input.style_line();
+            place(&view, &input);
         }
         if input.focused.replace(focused) == focused {
             return;
@@ -815,11 +851,13 @@ macro_rules! define_field {
                     let input = self.ivars().get().and_then(|cx| cx.input.upgrade());
                     if let Some(input) = &input {
                         input.focusing.set(true);
+                        input.save_field_editor(self);
                     }
                     // SAFETY: NSResponder's method, on the field.
                     let ok: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
                     if let Some(input) = &input {
                         input.focusing.set(false);
+                        if !ok { input.restore_field_editor(); }
                     }
                     if ok && let Some(cx) = self.ivars().get() {
                         cx.focus_changed(true);
@@ -1373,12 +1411,33 @@ define_class!(
 );
 
 impl InputState {
+    /// Capture defaults before AppKit configures the editor from our cell.
+    fn save_field_editor(&self, field: &NSTextField) {
+        if self.field_style.borrow().is_some() {
+            return;
+        }
+        let Some(editor) = field.cell().and_then(|cell| cell.fieldEditorForView(field)) else {
+            return;
+        };
+        *self.field_style.borrow_mut() = Some(FieldEditorStyle {
+            editor: objc2::rc::Weak::from(&*editor),
+            owner: objc2::rc::Weak::from(field),
+            paragraph: editor.defaultParagraphStyle(),
+            typing: editor.typingAttributes(),
+        });
+    }
+
+    fn restore_field_editor(&self) {
+        let saved = self.field_style.borrow_mut().take();
+        drop(saved);
+    }
+
     fn update_placeholder(&self) {
         let editor = self.editor.borrow();
-        let shown = matches!(&*editor, Editor::Area { .. })
-            && !self.config.borrow().placeholder.is_empty()
-            && editor.is_empty();
-        self.placeholder.setHidden(!shown);
+        if let Editor::Area { placeholder, .. } = &*editor {
+            let shown = !self.config.borrow().placeholder.is_empty() && editor.is_empty();
+            placeholder.setHidden(!shown);
+        }
     }
 
     /// Sets the text without reporting it, keeping the caret where it was
@@ -1390,6 +1449,8 @@ impl InputState {
         let caret = editor.selection().map(|(_, end)| end);
         self.applying.set(true);
         editor.set_text(text);
+        self.style_line();
+        self.style_editor();
         if let Some(caret) = caret {
             let len = utf16_len(text) as u32;
             let caret = if caret >= old_len {
@@ -1421,9 +1482,28 @@ impl InputState {
         )
     }
 
-    /// Caret and selection colors of the view that edits now (the window's
-    /// field editor is shared, so a field sets them when it takes the
-    /// focus).
+    /// Styles the stored value only when a field editor does not own it.
+    fn style_line(&self) {
+        let editor = self.editor.borrow().clone();
+        let Editor::Line { field, .. } = &editor else {
+            return;
+        };
+        if field.currentEditor().is_some() {
+            return;
+        }
+        let config = self.config.borrow();
+        let font = crate::text::ns_font(&config.style);
+        field.setAttributedStringValue(&input_text(
+            &field.stringValue(),
+            &config,
+            &font,
+            &self.text_color(),
+            alignment(config.align),
+        ));
+    }
+
+    /// Paragraph, caret and selection attributes of the editor. Fields reset
+    /// the shared editor on focus so styles do not leak between inputs.
     fn style_editor(&self) {
         let Some(editor) = self.editor.borrow().editing() else {
             return;
@@ -1432,6 +1512,33 @@ impl InputState {
             return;
         };
         let config = self.config.borrow();
+        {
+            let style = paragraph(&config, alignment(config.align));
+            let font = crate::text::ns_font(&config.style);
+            let offset = NSNumber::new_f64(input_baseline_offset(&font, &config));
+            view.setDefaultParagraphStyle(Some(&style));
+            // Updating attributes preserves text, selection and marked ranges.
+            // SAFETY: the paragraph style is a valid text attribute and the
+            // range covers the storage's existing UTF-16 characters.
+            unsafe {
+                edit_text_storage(&view, |storage| {
+                    storage.addAttribute_value_range(
+                        NSParagraphStyleAttributeName,
+                        &style,
+                        NSRange::new(0, storage.length()),
+                    );
+                    storage.addAttribute_value_range(
+                        NSBaselineOffsetAttributeName,
+                        &offset,
+                        NSRange::new(0, storage.length()),
+                    );
+                });
+                let typing = view.typingAttributes().mutableCopy();
+                typing.insert(NSParagraphStyleAttributeName, style.as_ref());
+                typing.insert(NSBaselineOffsetAttributeName, offset.as_ref());
+                view.setTypingAttributes(&typing);
+            }
+        }
         let caret = if config.caret_hidden {
             NSColor::clearColor()
         } else {
@@ -1466,18 +1573,10 @@ pub(crate) fn create(surface: &Rc<Surface>, view: &NshView) {
         let delegate = InputDelegate::alloc(mtm).set_ivars(cx.clone());
         // SAFETY: NSObject's initializer.
         let delegate: Retained<InputDelegate> = unsafe { msg_send![super(delegate), init] };
-        let placeholder = NSTextField::labelWithString(&NSString::new(), mtm);
-        placeholder.setHidden(true);
-        placeholder.setSelectable(false);
-        if let Some(cell) = placeholder.cell() {
-            cell.setWraps(true);
-            cell.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
-        }
         InputState {
             editor: RefCell::new(new_editor(mtm, &cx, &delegate, false, false)),
             delegate,
             pad: InputPad::create(mtm),
-            placeholder,
             config: RefCell::new(InputConfig::default()),
             configured: Cell::new(false),
             content: Cell::new(None),
@@ -1495,10 +1594,43 @@ pub(crate) fn create(surface: &Rc<Surface>, view: &NshView) {
             focusing: Cell::new(false),
             key_mods: Cell::new(NSEventModifierFlags::empty()),
             anim_color: Cell::new(None),
+            field_style: RefCell::new(None),
             cx,
         }
     });
     view.state_mut().input = Some(input);
+}
+
+/// Coalesces attributes and notifies TextKit 2's content manager when present.
+fn edit_text_storage(view: &NSTextView, edit: impl Fn(&NSTextStorage)) {
+    // SAFETY: the view owns its live text system throughout this synchronous edit.
+    let Some(storage) = (unsafe { view.textStorage() }) else {
+        return;
+    };
+    let update = || {
+        storage.beginEditing();
+        edit(&storage);
+        storage.endEditing();
+    };
+    if let Some(content) = view.textContentStorage() {
+        content.performEditingTransactionUsingBlock(&block2::StackBlock::new(update));
+    } else {
+        update();
+    }
+}
+
+/// Shared container geometry for multiline values and their placeholder.
+fn configure_text_view(view: &NSTextView) {
+    view.setDrawsBackground(false);
+    view.setRichText(false);
+    view.setImportsGraphics(false);
+    view.setTextContainerInset(CGSize::new(0.0, 0.0));
+    // SAFETY: the text view's own container.
+    if let Some(container) = unsafe { view.textContainer() } {
+        container.setLineFragmentPadding(0.0);
+        container.setWidthTracksTextView(true);
+        container.setContainerSize(CGSize::new(view.frame().size.width, CGFloat::MAX));
+    }
 }
 
 /// A new editor, hooked to `delegate`.
@@ -1521,28 +1653,19 @@ fn new_editor(
         let cell = OnceCell::new();
         let _ = cell.set(cx.clone());
         let this = TextArea::alloc(mtm).set_ivars(cell);
-        // SAFETY: NSTextView's initializer (it makes its own text system).
-        let area: Retained<TextArea> = unsafe {
-            msg_send![super(this), initWithFrame: ns_rect(0.0, 0.0, size.width as f32, size.height as f32)]
-        };
+        // SAFETY: NSTextView's initializer, selecting TextKit 2 explicitly.
+        let area: Retained<TextArea> =
+            unsafe { msg_send![super(this), initUsingTextLayoutManager: true] };
         // SAFETY: the class is a subclass of NSTextView.
         let view: Retained<NSTextView> = unsafe { Retained::cast_unchecked(area) };
+        view.setFrame(ns_rect(0.0, 0.0, size.width as f32, size.height as f32));
+        configure_text_view(&view);
         view.setMinSize(CGSize::new(0.0, size.height));
         view.setMaxSize(CGSize::new(CGFloat::MAX, CGFloat::MAX));
         view.setVerticallyResizable(true);
         view.setHorizontallyResizable(false);
         view.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
-        view.setDrawsBackground(false);
-        view.setRichText(false);
-        view.setImportsGraphics(false);
         view.setAllowsUndo(true);
-        view.setTextContainerInset(CGSize::new(0.0, 0.0));
-        // SAFETY: the text view's own container.
-        if let Some(container) = unsafe { view.textContainer() } {
-            container.setLineFragmentPadding(0.0);
-            container.setWidthTracksTextView(true);
-            container.setContainerSize(CGSize::new(size.width, CGFloat::MAX));
-        }
         view.setDelegate(Some(ProtocolObject::from_ref(delegate)));
         scroller.setDocumentView(Some(&view));
         // Scrolling the text moves the caret (`onSelectionChange`).
@@ -1560,7 +1683,17 @@ fn new_editor(
                     Some(&clip),
                 );
         }
-        Editor::Area { scroller, view }
+        let placeholder = NSTextView::initUsingTextLayoutManager(NSTextView::alloc(mtm), true);
+        configure_text_view(&placeholder);
+        placeholder.setHidden(true);
+        placeholder.setEditable(false);
+        placeholder.setSelectable(false);
+        placeholder.setAccessibilityElement(false);
+        Editor::Area {
+            scroller,
+            view,
+            placeholder,
+        }
     } else {
         let field = if secure {
             SecureField::create(mtm, cx.clone())
@@ -1603,8 +1736,8 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
             input.cx.unfocus();
         }
         old.host().removeFromSuperview();
-        if let Editor::Area { .. } = old {
-            input.placeholder.removeFromSuperview();
+        if let Editor::Area { placeholder, .. } = old {
+            placeholder.removeFromSuperview();
         }
         let editor = new_editor(
             surface.mtm,
@@ -1645,7 +1778,11 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
                 editor.setAlignment(align);
             }
         }
-        Editor::Area { view: text, .. } => {
+        Editor::Area {
+            view: text,
+            placeholder: placeholder_view,
+            ..
+        } => {
             text.setFont(Some(&font));
             text.setTextColor(Some(&color));
             text.setAlignment(align);
@@ -1655,24 +1792,28 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
             text.setContinuousSpellCheckingEnabled(config.auto_correct);
             text.setAutomaticSpellingCorrectionEnabled(config.auto_correct);
             text.setDefaultParagraphStyle(Some(&paragraph(config, align)));
-            let label = &input.placeholder;
-            label.setFont(Some(&font));
-            label.setTextColor(Some(&placeholder_color(config)));
-            label.setAlignment(align);
-            label.setBaseWritingDirection(direction);
-            label.setStringValue(&NSString::from_str(&config.placeholder));
+            let hint =
+                (!config.placeholder.is_empty()).then(|| NSString::from_str(&config.placeholder));
+            text.setAccessibilityPlaceholderValue(hint.as_deref());
+            placeholder_view.setFont(Some(&font));
+            placeholder_view.setTextColor(Some(&placeholder_color(config)));
+            placeholder_view.setAlignment(align);
+            placeholder_view.setBaseWritingDirection(direction);
+            edit_text_storage(placeholder_view, |storage| {
+                storage.setAttributedString(&placeholder(config, &font, align));
+            });
         }
     }
     *input.config.borrow_mut() = config.clone();
-    if editor.focused() {
-        input.style_editor();
-    }
+    input.style_line();
+    input.style_editor();
     input.update_placeholder();
     let first = !input.configured.replace(true);
     if first && config.auto_focus {
         auto_focus(surface, &input);
     }
     place(view, &input);
+    input.cx.caret_moved();
 }
 
 /// The horizontal alignment of the text; natural follows the writing
@@ -1691,6 +1832,11 @@ fn alignment(align: TextAlign) -> NSTextAlignment {
 fn paragraph(config: &InputConfig, align: NSTextAlignment) -> Retained<NSMutableParagraphStyle> {
     let style = NSMutableParagraphStyle::new();
     style.setAlignment(align);
+    style.setBaseWritingDirection(if config.rtl {
+        NSWritingDirection::RightToLeft
+    } else {
+        NSWritingDirection::Natural
+    });
     let line_height = config.style.line_height;
     if line_height > Points::ZERO {
         style.setMinimumLineHeight(line_height.0 as CGFloat);
@@ -1713,30 +1859,77 @@ fn placeholder(
     align: NSTextAlignment,
 ) -> Retained<NSAttributedString> {
     let color = placeholder_color(config);
-    // AppKit's single-line field editor uses the font's natural line
-    // height. A fixed paragraph height here would move only the
-    // placeholder's baseline, away from the text and caret.
-    let paragraph = NSMutableParagraphStyle::new();
-    paragraph.setAlignment(align);
+    input_text(
+        &NSString::from_str(&config.placeholder),
+        config,
+        font,
+        &color,
+        align,
+    )
+}
+
+/// Font, color and paragraph metrics shared by input values and placeholders.
+fn input_text(
+    text: &NSString,
+    config: &InputConfig,
+    font: &objc2_app_kit::NSFont,
+    color: &NSColor,
+    align: NSTextAlignment,
+) -> Retained<NSAttributedString> {
+    let paragraph = paragraph(config, align);
+    let offset = NSNumber::new_f64(input_baseline_offset(font, config));
     // SAFETY: immutable AppKit attribute keys with values of their
-    // documented types (NSFont, NSColor, NSParagraphStyle).
+    // documented types (NSFont, NSColor, NSParagraphStyle and NSNumber).
     let keys = unsafe {
         [
             NSFontAttributeName,
             NSForegroundColorAttributeName,
             NSParagraphStyleAttributeName,
+            NSBaselineOffsetAttributeName,
         ]
     };
-    let values: [&AnyObject; 3] = [font.as_ref(), color.as_ref(), paragraph.as_ref()];
+    let values: [&AnyObject; 4] = [
+        font.as_ref(),
+        color.as_ref(),
+        paragraph.as_ref(),
+        offset.as_ref(),
+    ];
     let attributes = NSDictionary::from_slices(&keys, &values);
     // SAFETY: a string and a dictionary of valid attributes.
     unsafe {
         NSAttributedString::initWithString_attributes(
             NSAttributedString::alloc(),
-            &NSString::from_str(&config.placeholder),
+            text,
             Some(&attributes),
         )
     }
+}
+
+/// Single-line fields split extra leading around the font's line. Multiline
+/// TextKit 2 views use native paragraph metrics without shifting the baseline.
+fn input_baseline_offset(font: &objc2_app_kit::NSFont, config: &InputConfig) -> CGFloat {
+    let line_height = config.style.line_height;
+    if !config.multiline && line_height > Points::ZERO {
+        let natural = font.ascender() - font.descender() + font.leading();
+        (line_height.0 as CGFloat - natural) / 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Changes only the foreground color, preserving typography and text.
+fn recolor(text: &NSAttributedString, color: &NSColor) -> Retained<NSMutableAttributedString> {
+    let text = text.mutableCopy();
+    // SAFETY: the color is a valid foreground attribute; the range covers
+    // all existing UTF-16 characters, including surrogate pairs.
+    unsafe {
+        text.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            color,
+            NSRange::new(0, text.length()),
+        );
+    }
+    text
 }
 
 /// Focuses the input once it is in a window (`autoFocus`): the view is
@@ -1801,12 +1994,19 @@ fn place(view: &NshView, input: &InputState) {
     match &*input.editor.borrow() {
         Editor::Line { field, .. } => {
             // One line, centered in the box as UIKit centers it; a box
-            // shorter than the line grows around its center. The cell
+            // shorter than the line grows around its center. The field's
+            // intrinsic size only accounts for its font, so explicit line
+            // heights also size the editor's clipping view. The cell
             // insets its text by the field editor's line padding: the
             // field reaches past the box by as much, so the text starts at
             // the content box.
             let pad = FIELD_PADDING;
-            let height = field.intrinsicContentSize().height as f32;
+            let line_height = input.config.borrow().style.line_height.0;
+            let height = if line_height > 0.0 {
+                line_height
+            } else {
+                field.intrinsicContentSize().height as f32
+            };
             let rect = Bounds {
                 origin: Point {
                     x: Points(content.origin.x.0 - pad),
@@ -1819,17 +2019,14 @@ fn place(view: &NshView, input: &InputState) {
             };
             host(field, rect);
         }
-        Editor::Area { scroller, .. } => {
-            // The placeholder goes first: hosted views stack in order. A
-            // label insets its text as a field does.
-            let label = Bounds {
-                origin: Point::new(content.origin.x - px(FIELD_PADDING), content.origin.y),
-                size: Size::new(
-                    content.size.width + px(2.0 * FIELD_PADDING),
-                    content.size.height,
-                ),
-            };
-            host(&input.placeholder, label);
+        Editor::Area {
+            scroller,
+            placeholder,
+            ..
+        } => {
+            // Both text views use the same container padding and content box.
+            // The placeholder goes first, below the transparent editor.
+            host(placeholder, content);
             host(scroller, content);
         }
     }
@@ -1878,6 +2075,12 @@ pub(crate) fn animated(view: &NshView) {
             field.setTextColor(Some(&color));
             if let Some(editor) = field.currentEditor() {
                 editor.setTextColor(Some(&color));
+            } else {
+                // A field's textColor does not override an attributed value.
+                let value = field.attributedStringValue();
+                if value.length() != 0 {
+                    field.setAttributedStringValue(&recolor(&value, &color));
+                }
             }
         }
         Editor::Area { view, .. } => view.setTextColor(Some(&color)),
@@ -2017,9 +2220,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_line_placeholder_matches_native_editor_metrics() {
+    fn recoloring_preserves_text_and_every_other_attribute() {
         let font = objc2_app_kit::NSFont::systemFontOfSize(16.0);
-        for line_height in [0.0, 16.0, 24.0, 32.0] {
+        let mut config = InputConfig::default();
+        config.style.line_height = px(32.0);
+        let original = input_text(
+            &NSString::from_str("你好🙂 Value"),
+            &config,
+            &font,
+            &NSColor::redColor(),
+            NSTextAlignment::Center,
+        );
+        let mut value = original.clone();
+        for color in [
+            NSColor::purpleColor(),
+            NSColor::blueColor(),
+            NSColor::redColor(),
+        ] {
+            let next = recolor(&value, &color);
+            assert_eq!(next.string(), original.string());
+            for index in 0..original.length() {
+                // SAFETY: each index is within the existing UTF-16 string;
+                // no effective range is requested.
+                unsafe {
+                    let expected = original
+                        .attributesAtIndex_effectiveRange(index, std::ptr::null_mut())
+                        .mutableCopy();
+                    expected.insert(NSForegroundColorAttributeName, color.as_ref());
+                    let actual = next.attributesAtIndex_effectiveRange(index, std::ptr::null_mut());
+                    assert!(actual.isEqualToDictionary(&expected));
+                }
+            }
+            value = Retained::into_super(next);
+        }
+    }
+
+    #[test]
+    fn input_values_and_placeholders_share_paragraph_metrics() {
+        let font = objc2_app_kit::NSFont::systemFontOfSize(16.0);
+        for line_height in [0.0, 16.0, 24.0, 32.0, 48.0] {
             let mut config = InputConfig::default();
             config.placeholder.push_str("Placeholder");
             config.style.line_height = px(line_height);
@@ -2028,27 +2267,70 @@ mod tests {
                 NSTextAlignment::Center,
                 NSTextAlignment::Right,
             ] {
-                let text = placeholder(&config, &font, align);
-                // SAFETY: index zero is in the nonempty attributed string;
-                // no effective range is requested.
-                let style = unsafe {
-                    text.attribute_atIndex_effectiveRange(
-                        NSParagraphStyleAttributeName,
-                        0,
-                        std::ptr::null_mut(),
-                    )
+                for text in [
+                    placeholder(&config, &font, align),
+                    input_text(
+                        &NSString::from_str("Value"),
+                        &config,
+                        &font,
+                        &NSColor::textColor(),
+                        align,
+                    ),
+                ] {
+                    // SAFETY: index zero is in the nonempty attributed string;
+                    // no effective range is requested.
+                    let style = unsafe {
+                        text.attribute_atIndex_effectiveRange(
+                            NSParagraphStyleAttributeName,
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .unwrap()
+                    .downcast::<objc2_app_kit::NSParagraphStyle>()
+                    .unwrap();
+                    assert_eq!(style.alignment(), align);
+                    assert_eq!(style.minimumLineHeight(), line_height as CGFloat);
+                    assert_eq!(style.maximumLineHeight(), line_height as CGFloat);
+                    // SAFETY: index zero is valid and no effective range is requested.
+                    let offset = unsafe {
+                        text.attribute_atIndex_effectiveRange(
+                            NSBaselineOffsetAttributeName,
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .unwrap()
+                    .downcast::<NSNumber>()
+                    .unwrap();
+                    let natural = font.ascender() - font.descender() + font.leading();
+                    let expected = if line_height > 0.0 {
+                        (line_height as CGFloat - natural) / 2.0
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(offset.doubleValue(), expected);
                 }
-                .unwrap()
-                .downcast::<objc2_app_kit::NSParagraphStyle>()
-                .unwrap();
-                assert_eq!(style.alignment(), align);
-                assert_eq!(style.minimumLineHeight(), 0.0);
-                assert_eq!(style.maximumLineHeight(), 0.0);
             }
             // Multiline editors keep the requested paragraph line height.
             let style = paragraph(&config, NSTextAlignment::Left);
             assert_eq!(style.minimumLineHeight(), line_height as CGFloat);
             assert_eq!(style.maximumLineHeight(), line_height as CGFloat);
+        }
+    }
+
+    #[test]
+    fn paragraph_preserves_explicit_writing_direction() {
+        let mut config = InputConfig::default();
+        for (rtl, direction) in [
+            (true, NSWritingDirection::RightToLeft),
+            (false, NSWritingDirection::Natural),
+        ] {
+            config.rtl = rtl;
+            assert_eq!(
+                paragraph(&config, NSTextAlignment::Natural).baseWritingDirection(),
+                direction,
+            );
         }
     }
 

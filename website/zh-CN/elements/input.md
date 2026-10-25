@@ -202,8 +202,9 @@ let password!: YNode;
 
 ## 平台说明
 
-- 在 macOS 上，单行文字、提示文字和光标使用原生输入框一致的字体度量，在内容区域内一起垂直居中。
-  `lineHeight` 参与布局；多行编辑器同时用它控制段落行高。
+- 在 macOS 上，`lineHeight` 设置单行输入的行框和多行编辑器的段落行高。单行文字、提示文字和光标使用一致的行布局，
+  行框在内容区域内垂直居中，额外行距均分到字体行的上下两侧。多行文字和提示文字使用 TextKit 2 一致的原生段落排版。
+  不设置 `lineHeight` 时使用原生字体度量。
 - [滚动视图](./scroll.md#键盘)中的输入框会在原生侧自动避开键盘。其他位置请使用 [`KeyboardAvoidingView`](./keyboard-avoiding-view.md)。
 - `disabled` 除了应用禁用样式，还会禁用输入框（不能获得焦点）；`readonly` 的输入框仍可获得焦点和选择文本。
 - `inputAccessoryViewID` 在 iOS 上生效，那里的键盘有附件栏。
